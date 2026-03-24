@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Template Whisperer</title>
+  <script src="https://cdn.jsdelivr.net/npm/pizzip@3.2.0/dist/pizzip.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; }
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #8b949e; margin-bottom: 2rem; font-size: 0.9rem; }
+    .drop-zone { border: 2px dashed #30363d; border-radius: 8px; padding: 3rem 2rem; text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s; margin-bottom: 1.5rem; }
+    .drop-zone:hover, .drop-zone.dragover { border-color: #58a6ff; background: #161b22; }
+    .drop-zone p { color: #8b949e; margin-bottom: 0.5rem; }
+    .drop-zone .browse { color: #58a6ff; text-decoration: underline; cursor: pointer; }
+    input[type="file"] { display: none; }
+    .actions { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap; align-items: center; }
+    .btn { padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e1e4e8; cursor: pointer; font-size: 0.85rem; transition: background 0.15s; }
+    .btn:hover { background: #30363d; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn.primary { background: #238636; border-color: #238636; }
+    .btn.primary:hover { background: #2ea043; }
+    .btn.primary:disabled { background: #238636; }
+    .toggle { display: flex; align-items: center; gap: 0.4rem; color: #8b949e; font-size: 0.85rem; cursor: pointer; user-select: none; }
+    .toggle input { cursor: pointer; }
+    .file-info { color: #8b949e; font-size: 0.85rem; }
+    #results { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 0.82rem; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+    .result-section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+    .err { color: #f85149; }
+    .warn { color: #d29922; }
+    .ok { color: #3fb950; }
+    .gray { color: #8b949e; }
+    .blue { color: #58a6ff; }
+    .cyan { color: #79c0ff; }
+    .bold { font-weight: 600; }
+    .summary { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #30363d; }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 0.4rem; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .tagline { color: #484f58; font-size: 0.75rem; margin-top: 3rem; text-align: center; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Template Whisperer</h1>
+    <p class="subtitle">Check and fix docxtemplater templates. Files are processed locally - nothing is uploaded.</p>
+
+    <div class="drop-zone" id="dropZone">
+      <p>Drop a <strong>.docx</strong> file here</p>
+      <p>or <span class="browse" id="browseBtn">browse</span> if dragging is too exciting</p>
+    </div>
+    <input type="file" id="fileInput" accept=".docx">
+
+    <div class="actions">
+      <button class="btn primary" id="fixBtn" disabled>Fix &amp; Download</button>
+      <label class="toggle"><input type="checkbox" id="showWarnings"> Show warnings</label>
+      <span class="file-info" id="fileInfo"></span>
+    </div>
+
+    <div id="results"></div>
+
+    <p class="tagline">You know what this is for.</p>
+  </div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Core checker logic - docxtemplater tag validation
+// ---------------------------------------------------------------------------
+
+const TAG_PREFIXES = ["#", "/", "^", "%", "@"];
+const DOCX_CONTENT_FILES = [
+  "word/document.xml", "word/header1.xml", "word/header2.xml", "word/header3.xml",
+  "word/footer1.xml", "word/footer2.xml", "word/footer3.xml",
+];
+
+function getXmlFiles(zip) {
+  const files = [];
+  for (const name of DOCX_CONTENT_FILES) {
+    if (zip.files[name]) files.push({ name, content: zip.file(name).asText() });
+  }
+  return files;
+}
+
+function extractTextSegments(xml) {
+  const segments = [];
+  const re = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    segments.push({ text: m[1], xmlOffset: m.index, xmlLength: m[0].length, textOffset: m.index + m[0].indexOf(">") + 1 });
+  }
+  return segments;
+}
+
+function buildFlatText(segments) {
+  let flat = "";
+  const map = [];
+  for (let i = 0; i < segments.length; i++) {
+    const start = flat.length;
+    flat += segments[i].text;
+    map.push({ flatStart: start, flatEnd: flat.length, segIndex: i });
+  }
+  return { flat, map };
+}
+
+function nearText(flat, offset, len) {
+  if (len == null) len = 80;
+  const start = Math.max(0, offset - len);
+  const end = Math.min(flat.length, offset + len);
+  let snippet = flat.slice(start, end);
+  if (start > 0) snippet = "..." + snippet;
+  if (end < flat.length) snippet = snippet + "...";
+  return snippet;
+}
+
+function segIndexAt(map, flatOffset) {
+  for (const entry of map) {
+    if (flatOffset >= entry.flatStart && flatOffset < entry.flatEnd) return entry.segIndex;
+  }
+  return -1;
+}
+
+function findDelimiterErrors(flat) {
+  const errors = [];
+  let inTag = false, tagStart = -1;
+  for (let i = 0; i < flat.length; i++) {
+    const ch = flat[i];
+    if (ch === "{") {
+      if (inTag) {
+        if (flat[i + 1] === "{") {
+          errors.push({ id: "duplicate_open_tag", offset: tagStart, message: 'Duplicate opening delimiter "{{"', context: nearText(flat, tagStart) });
+          i++;
+          inTag = false;
+        } else {
+          const xtag = flat.substring(tagStart, i);
+          errors.push({ id: "unclosed_tag", offset: tagStart, message: `Unclosed tag starting with "${xtag.substring(0, 30)}"`, context: nearText(flat, tagStart) });
+        }
+        tagStart = i;
+      } else { inTag = true; tagStart = i; }
+    } else if (ch === "}") {
+      if (inTag) { inTag = false; }
+      else {
+        if (i + 1 < flat.length && flat[i + 1] === "}") {
+          errors.push({ id: "duplicate_close_tag", offset: i, message: 'Duplicate closing delimiter "}}"', context: nearText(flat, i) });
+          i++;
+        } else {
+          errors.push({ id: "unopened_tag", offset: i, message: 'Closing "}" without a matching opening "{"', context: nearText(flat, i) });
+        }
+      }
+    }
+  }
+  if (inTag) {
+    const xtag = flat.substring(tagStart);
+    errors.push({ id: "unclosed_tag", offset: tagStart, message: `Unclosed tag starting with "${xtag.substring(0, 30)}"`, context: nearText(flat, tagStart) });
+  }
+  return errors;
+}
+
+function extractTags(flat) {
+  const tags = [];
+  let inTag = false, tagStart = -1;
+  for (let i = 0; i < flat.length; i++) {
+    if (flat[i] === "{") { inTag = true; tagStart = i; }
+    else if (flat[i] === "}" && inTag) {
+      inTag = false;
+      tags.push({ raw: flat.substring(tagStart, i + 1), inner: flat.substring(tagStart + 1, i), offset: tagStart });
+    }
+  }
+  return tags;
+}
+
+function stripFilters(body) {
+  let result = "";
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "|") {
+      if (body[i + 1] === "|") { result += "||"; i++; }
+      else return result.trim();
+    } else result += body[i];
+  }
+  return result.trim();
+}
+
+function extractFilterParts(body) {
+  const parts = [];
+  let current = "", pastFirstPipe = false;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "|") {
+      if (body[i + 1] === "|") { current += "||"; i++; }
+      else { if (pastFirstPipe) parts.push(current); pastFirstPipe = true; current = ""; }
+    } else current += body[i];
+  }
+  if (pastFirstPipe) parts.push(current);
+  return parts;
+}
+
+function checkEmvisageTags(tags) {
+  const errors = [];
+  const loopStack = [];
+  for (const tag of tags) {
+    const inner = tag.inner.trim();
+    for (const pfx of TAG_PREFIXES) {
+      if (tag.inner.startsWith(pfx) && tag.inner[pfx.length] === " ") {
+        errors.push({ id: "space_after_prefix", offset: tag.offset, message: `Space after "${pfx}" prefix in tag "${tag.raw}" - remove the space after "${pfx}"`, context: tag.raw });
+      }
+    }
+    let prefix = "", body = inner;
+    if (inner.length > 0 && TAG_PREFIXES.includes(inner[0])) { prefix = inner[0]; body = inner.substring(1).trim(); }
+    const isExpression = /[!=<>]|&&|\|\|/.test(body);
+    const bodyBeforeFilter = stripFilters(body);
+    if (inner.startsWith("=") && inner.endsWith("=")) continue;
+    if (prefix !== "/" || bodyBeforeFilter !== "") {
+      const keyPaths = body.replace(/\|(?!\|)[^|]*/g, "").split(/\s*(?:==|!=|>=|<=|>|<|&&|\|\|)\s*/).map(s => s.trim()).filter(s => s.length > 0 && !s.startsWith('"') && !s.startsWith("'"));
+      for (const keyPath of keyPaths) {
+        if (/\s/.test(keyPath)) errors.push({ id: "space_in_key", offset: tag.offset, message: `Key path "${keyPath}" in tag "${tag.raw}" contains a space`, context: tag.raw });
+      }
+    }
+    const insideLoop = loopStack.length > 0;
+    if (prefix !== "/" && bodyBeforeFilter.length > 0 && !isExpression) {
+      if (!bodyBeforeFilter.startsWith("model.") && !insideLoop) {
+        errors.push({ id: "missing_model_prefix", offset: tag.offset, message: `Tag "${tag.raw}" does not start with "model."`, context: tag.raw });
+      }
+    }
+    const loopTag = isExpression ? body : bodyBeforeFilter;
+    if (prefix === "#" || prefix === "^") {
+      loopStack.push({ tag: loopTag, offset: tag.offset, raw: tag.raw, prefix, isExpression });
+    } else if (prefix === "/") {
+      if (bodyBeforeFilter === "") {
+        if (loopStack.length === 0) errors.push({ id: "unopened_loop", offset: tag.offset, message: `Closing tag "${tag.raw}" has no matching opening tag`, context: tag.raw });
+        else loopStack.pop();
+      } else if (loopStack.length === 0) {
+        errors.push({ id: "unopened_loop", offset: tag.offset, message: `Closing tag "${tag.raw}" has no matching opening tag`, context: tag.raw });
+      } else {
+        const last = loopStack[loopStack.length - 1];
+        if (last.tag !== bodyBeforeFilter) {
+          errors.push({ id: "closing_tag_mismatch", offset: tag.offset, message: `Closing tag "${tag.raw}" does not match opening tag "${last.raw}"`, context: `opened "${last.raw}" at offset ${last.offset}, closed with "${tag.raw}"` });
+        }
+        loopStack.pop();
+      }
+    }
+    if (body.includes("|")) {
+      const filterParts = extractFilterParts(body);
+      for (const filterExpr of filterParts) {
+        const filterName = filterExpr.trim().split(":")[0].trim().split(" ")[0].trim();
+        if (filterName.length === 0) errors.push({ id: "empty_filter", offset: tag.offset, message: `Empty filter name in tag "${tag.raw}"`, context: tag.raw });
+      }
+    }
+  }
+  for (const open of loopStack) {
+    errors.push({ id: "unclosed_loop", offset: open.offset, message: `Opening tag "${open.raw}" is never closed`, context: open.raw });
+  }
+  return errors;
+}
+
+function findXmlRunSplits(segments, map, flat, xml) {
+  const errors = [];
+  let inTag = false, tagStartSeg = -1, tagStartFlat = -1;
+  for (let i = 0; i < flat.length; i++) {
+    if (flat[i] === "{") { inTag = true; tagStartFlat = i; tagStartSeg = segIndexAt(map, i); }
+    else if (flat[i] === "}" && inTag) {
+      inTag = false;
+      const tagEndSeg = segIndexAt(map, i);
+      if (tagStartSeg !== -1 && tagEndSeg !== -1 && tagStartSeg !== tagEndSeg) {
+        const tagText = flat.substring(tagStartFlat, i + 1);
+        const seg1 = segments[tagStartSeg], seg2 = segments[tagEndSeg];
+        const xmlCtxStart = Math.max(0, seg1.xmlOffset - 120);
+        const xmlCtxEnd = Math.min(xml.length, seg2.xmlOffset + seg2.xmlLength + 120);
+        errors.push({ id: "xml_run_split", offset: tagStartFlat, message: `Tag "${tagText}" is split across ${tagEndSeg - tagStartSeg + 1} XML runs`, context: tagText, xmlContext: xml.slice(xmlCtxStart, xmlCtxEnd), fix: "Select the entire tag text in Word, clear formatting (Ctrl+Space), and retype it in one go" });
+      }
+    }
+  }
+  return errors;
+}
+
+function findStrayParagraphs(xml) {
+  const errors = [];
+  const paras = xml.split(/(?=<w:p[ >])/);
+  const textRe = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+  function flatText(p) { let flat = "", m; textRe.lastIndex = 0; while ((m = textRe.exec(p)) !== null) flat += m[1]; return flat; }
+  function isStructurallyEmpty(p) {
+    if (flatText(p).trim() !== "") return false;
+    if (/<w:drawing[ >]/.test(p)) return false;
+    if (/<w:pict[ >]/.test(p)) return false;
+    if (/w:txbxContent/.test(p)) return false;
+    if (/<mc:AlternateContent[ >]/.test(p)) return false;
+    return true;
+  }
+  const paraInfo = paras.map((p, i) => ({ text: flatText(p), structEmpty: isStructurallyEmpty(p), index: i }));
+  const transitions = [];
+  for (let i = 0; i < paraInfo.length; i++) {
+    const text = paraInfo[i].text.trim();
+    const transMatch = text.match(/^(\{\/[^}]*\})\s*(\{[#^])([^}]*)\}/);
+    if (!transMatch) continue;
+    let structEmptyCount = 0, j = i - 1;
+    while (j >= 0 && paraInfo[j].text.trim() === "") { if (paraInfo[j].structEmpty) structEmptyCount++; j--; }
+    const patternKey = transMatch[3].replace(/==\s*"[^"]*"/g, '== "..."').replace(/!=\s*"[^"]*"/g, '!= "..."');
+    transitions.push({ structEmptyCount, paraIndex: i, nextText: text, patternKey });
+  }
+  const groups = {};
+  for (const t of transitions) { if (!groups[t.patternKey]) groups[t.patternKey] = []; groups[t.patternKey].push(t); }
+  for (const [, members] of Object.entries(groups)) {
+    if (members.length < 2) continue;
+    const countFreq = {};
+    for (const m of members) countFreq[m.structEmptyCount] = (countFreq[m.structEmptyCount] || 0) + 1;
+    const modeCount = Number(Object.entries(countFreq).sort((a, b) => b[1] - a[1])[0][0]);
+    for (const m of members) {
+      if (m.structEmptyCount !== modeCount) {
+        const diff = m.structEmptyCount - modeCount;
+        const tagPreview = m.nextText.substring(0, 100);
+        errors.push({ id: "stray_empty_paragraph", offset: m.paraIndex, message: diff > 0 ? `${diff} extra empty paragraph(s) before "${tagPreview}"` : `${Math.abs(diff)} fewer empty paragraph(s) before "${tagPreview}"`, context: `[${m.structEmptyCount} struct-empty] > ${tagPreview}`, fix: diff > 0 ? `Remove ${diff} empty line(s) above this tag` : `Add ${Math.abs(diff)} empty line(s) above this tag` });
+      }
+    }
+  }
+  return errors;
+}
+
+function analyzeXmlFile(fileName, xml) {
+  const segments = extractTextSegments(xml);
+  const { flat, map } = buildFlatText(segments);
+  if (flat.trim().length === 0) return [];
+  const allErrors = [];
+  for (const err of findDelimiterErrors(flat)) allErrors.push({ ...err, file: fileName, severity: "error" });
+  for (const err of findXmlRunSplits(segments, map, flat, xml)) allErrors.push({ ...err, file: fileName, severity: "warning" });
+  const tags = extractTags(flat);
+  for (const err of checkEmvisageTags(tags)) allErrors.push({ ...err, file: fileName, severity: "error" });
+  for (const err of findStrayParagraphs(xml)) allErrors.push({ ...err, file: fileName, severity: "warning" });
+  const tagCount = tags.length;
+  if (tagCount > 0) {
+    const wtRe2 = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+    const singleTagRe2 = /^\{[#/^%@]?[^{}]+\}$/;
+    const anyTagRe2 = /\{[#/^%@]?[^{}]+\}/g;
+    const mergedLocations = [];
+    let wtm;
+    while ((wtm = wtRe2.exec(xml)) !== null) {
+      const text = wtm[1];
+      if (/\{[#/^%@]?[^{}]+\}/.test(text) && !singleTagRe2.test(text.trim())) {
+        anyTagRe2.lastIndex = 0;
+        const tagsInNode = [];
+        let tm;
+        while ((tm = anyTagRe2.exec(text)) !== null) tagsInNode.push(tm[0]);
+        mergedLocations.push({ text, tags: tagsInNode, xmlOffset: wtm.index });
+      }
+    }
+    if (mergedLocations.length > 0) {
+      const severity = mergedLocations.length > 100 ? "error" : "warning";
+      allErrors.push({ id: "merged_tag_runs", offset: 0, message: `${mergedLocations.length} template tag(s) sharing a run with surrounding text - generation may fail. Use Fix & Download to split them`, context: `${tagCount} total tags, ${mergedLocations.length} need splitting`, fix: "Use Fix & Download to split merged runs (bookmark-protected, survives Word re-save)", file: fileName, severity });
+      for (const loc of mergedLocations) {
+        allErrors.push({ id: "merged_tag_detail", offset: loc.xmlOffset, message: `Merged tag: ${loc.tags.join(", ")}`, context: loc.text, file: fileName, severity: "warning" });
+      }
+    }
+  }
+  return allErrors;
+}
+
+// ---------------------------------------------------------------------------
+// Fix functions
+// ---------------------------------------------------------------------------
+
+function fixXmlRunSplits(xml) {
+  let fixCount = 0;
+  for (let pass = 0; pass < 500; pass++) {
+    const segments = extractTextSegments(xml);
+    const { flat, map } = buildFlatText(segments);
+    let splitTag = null, inTag = false, tagStartFlat = -1;
+    for (let i = 0; i < flat.length; i++) {
+      if (flat[i] === "{") { inTag = true; tagStartFlat = i; }
+      else if (flat[i] === "}" && inTag) {
+        inTag = false;
+        const startSeg = segIndexAt(map, tagStartFlat), endSeg = segIndexAt(map, i);
+        if (startSeg !== -1 && endSeg !== -1 && startSeg !== endSeg) { splitTag = { flatStart: tagStartFlat, flatEnd: i, tagText: flat.substring(tagStartFlat, i + 1), startSeg, endSeg }; break; }
+      }
+    }
+    if (!splitTag) break;
+    const involvedSegs = [];
+    for (let s = splitTag.startSeg; s <= splitTag.endSeg; s++) involvedSegs.push({ ...segments[s], index: s });
+    const parts = involvedSegs.map((seg, idx) => {
+      const segFlatStart = map.find(m => m.segIndex === seg.index).flatStart;
+      const tagStartInSeg = Math.max(0, splitTag.flatStart - segFlatStart);
+      const tagEndInSeg = Math.min(seg.text.length, splitTag.flatEnd - segFlatStart + 1);
+      return { seg, textBefore: seg.text.substring(0, tagStartInSeg), tagPortion: seg.text.substring(Math.max(0, tagStartInSeg), tagEndInSeg), textAfter: seg.text.substring(tagEndInSeg < seg.text.length ? tagEndInSeg : seg.text.length) };
+    });
+    const replacements = [];
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i], seg = p.seg;
+      const newText = i === 0 ? p.textBefore + splitTag.tagText + p.textAfter : p.textBefore + p.textAfter;
+      const wtMatch = xml.substring(seg.xmlOffset).match(/^(<w:t(?:\s[^>]*)?>)([^<]*)(<\/w:t>)/);
+      if (wtMatch) {
+        let newOpenTag = wtMatch[1];
+        if (newText.length > 0 && (newText[0] === " " || newText[newText.length - 1] === " ") && !newOpenTag.includes('xml:space="preserve"')) newOpenTag = newOpenTag.replace("<w:t>", '<w:t xml:space="preserve">');
+        replacements.push({ start: seg.xmlOffset, end: seg.xmlOffset + wtMatch[0].length, replacement: newOpenTag + newText + wtMatch[3] });
+      }
+    }
+    for (const r of replacements) xml = xml.substring(0, r.start) + r.replacement + xml.substring(r.end);
+    fixCount++;
+  }
+  return { xml, fixCount };
+}
+
+function fixMergedTagRuns(xml) {
+  let fixCount = 0;
+  let bookmarkId = 0;
+  const existingIds = xml.match(/w:id="(\d+)"/g) || [];
+  for (const id of existingIds) { const n = parseInt(id.match(/\d+/)[0], 10); if (n > bookmarkId) bookmarkId = n; }
+  bookmarkId++;
+  for (let pass = 0; pass < 2000; pass++) {
+    const wtRe = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+    const tagRe = /\{[#/^%@]?[^{}]+\}/;
+    const singleTagRe = /^\{[#/^%@]?[^{}]+\}$/;
+    let wtMatch, found = null;
+    while ((wtMatch = wtRe.exec(xml)) !== null) {
+      if (singleTagRe.test(wtMatch[1].trim())) continue;
+      if (tagRe.test(wtMatch[1])) { found = { match: wtMatch, text: wtMatch[1] }; break; }
+    }
+    if (!found) break;
+    const wtStart = found.match.index, wtFull = found.match[0], textContent = found.text;
+    const xmlBefore = xml.substring(0, wtStart);
+    const rStart = Math.max(xmlBefore.lastIndexOf("<w:r>"), xmlBefore.lastIndexOf("<w:r "));
+    if (rStart === -1) break;
+    const between = xml.substring(rStart, wtStart);
+    if (/<w:r[ >]/.test(between.substring(4)) || /<w:drawing/.test(between) || /<mc:Alternate/.test(between)) break;
+    const rPrMatch = between.match(/<w:rPr>[\s\S]*<\/w:rPr>/);
+    const rPr = rPrMatch ? rPrMatch[0] : "";
+    const afterWt = wtStart + wtFull.length;
+    const rEndIdx = xml.indexOf("</w:r>", afterWt);
+    if (rEndIdx === -1) break;
+    const afterBetween = xml.substring(afterWt, rEndIdx);
+    if (/<w:t[ >]/.test(afterBetween) || /<w:drawing/.test(afterBetween)) break;
+    const fullRunEnd = rEndIdx + "</w:r>".length;
+    const splitRe = /(\{[#/^%@]?[^{}]+\})/g;
+    const parts = textContent.split(splitRe);
+    if (parts.length <= 1) break;
+    const runs = [];
+    for (const part of parts) {
+      if (part.length === 0) continue;
+      const isTag = tagRe.test(part);
+      const spaceAttr = (part[0] === " " || part[part.length - 1] === " ") ? ' xml:space="preserve"' : "";
+      const runXml = `<w:r>${rPr}<w:t${spaceAttr}>${part}</w:t></w:r>`;
+      if (isTag) { const bId = bookmarkId++; runs.push(`<w:bookmarkStart w:id="${bId}" w:name="_tw${bId}"/>${runXml}<w:bookmarkEnd w:id="${bId}"/>`); fixCount++; }
+      else runs.push(runXml);
+    }
+    xml = xml.substring(0, rStart) + runs.join("") + xml.substring(fullRunEnd);
+  }
+  return { xml, fixCount };
+}
+
+function fixDocx(zip) {
+  let totalFixes = 0;
+  const allXmlFiles = Object.keys(zip.files).filter(f => f.startsWith("word/") && f.endsWith(".xml"));
+  for (const name of allXmlFiles) {
+    let xml = zip.file(name).asText();
+    let changed = false;
+    const { xml: splitFixed, fixCount: splitCount } = fixXmlRunSplits(xml);
+    if (splitCount > 0) { xml = splitFixed; totalFixes += splitCount; changed = true; }
+    const { xml: tagFixed, fixCount: tagCount } = fixMergedTagRuns(xml);
+    if (tagCount > 0) { xml = tagFixed; totalFixes += tagCount; changed = true; }
+    if (changed) zip.file(name, xml);
+  }
+  return totalFixes;
+}
+
+// ---------------------------------------------------------------------------
+// UI Logic
+// ---------------------------------------------------------------------------
+
+const dropZone = document.getElementById("dropZone");
+const fileInput = document.getElementById("fileInput");
+const fixBtn = document.getElementById("fixBtn");
+const showWarnings = document.getElementById("showWarnings");
+const resultsDiv = document.getElementById("results");
+const fileInfo = document.getElementById("fileInfo");
+
+let currentFile = null;
+let currentErrors = [];
+
+document.getElementById("browseBtn").addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("click", (e) => { if (e.target === dropZone || e.target.tagName === "P") fileInput.click(); });
+dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("dragover"); });
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+dropZone.addEventListener("drop", (e) => { e.preventDefault(); dropZone.classList.remove("dragover"); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener("change", () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+showWarnings.addEventListener("change", () => { if (currentErrors.length > 0) renderResults(currentFile.name, currentErrors, showWarnings.checked); });
+
+fixBtn.addEventListener("click", async () => {
+  if (!currentFile) return;
+  fixBtn.disabled = true;
+  fixBtn.textContent = "Fixing...";
+  try {
+    const data = await currentFile.arrayBuffer();
+    const zip = new PizZip(data);
+    const totalFixes = fixDocx(zip);
+    const blob = new Blob([zip.generate({ type: "uint8array", compression: "DEFLATE" })], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const baseName = currentFile.name.replace(/\.docx$/i, "");
+    a.href = url; a.download = baseName + "_fixed.docx"; a.click();
+    URL.revokeObjectURL(url);
+    // Re-check the fixed file
+    const fixedZip = new PizZip(zip.generate({ type: "uint8array" }));
+    const xmlFiles = getXmlFiles(fixedZip);
+    const errors = [];
+    for (const { name, content } of xmlFiles) errors.push(...analyzeXmlFile(name, content));
+    currentErrors = errors;
+    renderResults(baseName + "_fixed.docx", errors, showWarnings.checked, totalFixes);
+  } finally { fixBtn.disabled = false; fixBtn.textContent = "Fix & Download"; }
+});
+
+async function handleFile(file) {
+  if (!file.name.toLowerCase().endsWith(".docx")) { alert("Please select a .docx file"); return; }
+  currentFile = file;
+  fileInfo.textContent = `${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
+  fixBtn.disabled = false;
+  resultsDiv.innerHTML = '<span class="gray"><span class="spinner"></span>Checking...</span>';
+  try {
+    const data = await file.arrayBuffer();
+    const zip = new PizZip(data);
+    const xmlFiles = getXmlFiles(zip);
+    if (xmlFiles.length === 0) { resultsDiv.innerHTML = '<span class="err">No content XML files found in docx</span>'; return; }
+    const errors = [];
+    for (const { name, content } of xmlFiles) errors.push(...analyzeXmlFile(name, content));
+    currentErrors = errors;
+    renderResults(file.name, errors, showWarnings.checked);
+  } catch (e) { resultsDiv.innerHTML = `<span class="err">Error reading file: ${esc(e.message)}</span>`; }
+}
+
+function renderResults(fileName, allErrors, warnings, fixCount) {
+  const totalErrors = allErrors.filter(e => e.severity === "error").length;
+  const totalWarnings = allErrors.filter(e => e.severity === "warning").length;
+  const display = warnings ? allErrors : allErrors.filter(e => e.severity === "error");
+
+  let html = `<div class="result-section"><span class="bold">Template check: ${esc(fileName)}</span>\n\n`;
+
+  if (fixCount) html += `<span class="ok bold">  Fixed ${fixCount} issue(s) - results after fix:</span>\n\n`;
+
+  if (display.length === 0 && totalWarnings === 0) {
+    html += '<span class="ok">  No issues found - template syntax looks good.</span>\n<span class="gray">  If your template still isn\'t working, try Fix &amp; Download - it splits merged XML runs that can cause silent failures.</span>';
+  } else if (display.length === 0 && totalWarnings > 0) {
+    html += `<span class="ok">  No errors found.</span>\n<span class="warn">  ${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} hidden (toggle Show warnings)</span>`;
+  } else {
+    const byFile = {};
+    for (const err of display) { if (!byFile[err.file]) byFile[err.file] = []; byFile[err.file].push(err); }
+    for (const [file, errors] of Object.entries(byFile)) {
+      html += `<span class="cyan">  ${esc(file)}</span>\n`;
+      for (const err of errors) {
+        const cls = err.severity === "error" ? "err" : "warn";
+        const icon = err.severity === "error" ? "\u2716" : "\u26A0";
+        html += `<span class="${cls}">  ${icon} [${esc(err.id)}]</span> ${esc(err.message)}\n`;
+        if (err.context) html += `<span class="gray">      context: ${esc(truncate(err.context, 200))}</span>\n`;
+        if (err.fix) html += `<span class="blue">      fix:     ${esc(err.fix)}</span>\n`;
+      }
+      html += "\n";
+    }
+  }
+
+  html += `<div class="summary"><span class="bold">  Summary: `;
+  const parts = [];
+  if (totalErrors > 0) parts.push(`<span class="err">${totalErrors} error${totalErrors > 1 ? "s" : ""}</span>`);
+  if (totalWarnings > 0) parts.push(`<span class="warn">${totalWarnings} warning${totalWarnings > 1 ? "s" : ""}${warnings ? "" : " (hidden)"}</span>`);
+  if (parts.length === 0) parts.push('<span class="ok">clean</span>');
+  html += parts.join(", ") + "</span></div>";
+  html += "</div>";
+  resultsDiv.innerHTML = html;
+}
+
+function truncate(str, len) { return str.length <= len ? str : str.substring(0, len) + "..."; }
+function esc(str) { return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+</script>
+</body>
+</html>
