@@ -205,11 +205,11 @@ function checkEmvisageTags(tags) {
     }
     let prefix = "", body = inner;
     if (inner.length > 0 && TAG_PREFIXES.includes(inner[0])) { prefix = inner[0]; body = inner.substring(1).trim(); }
-    const isExpression = /[!=<>]|&&|\|\|/.test(body);
+    const isExpression = /[!=<>]|&&|\|\||[*/+]/.test(body);
     const bodyBeforeFilter = stripFilters(body);
     if (inner.startsWith("=") && inner.endsWith("=")) continue;
     if (prefix !== "/" || bodyBeforeFilter !== "") {
-      const keyPaths = body.replace(/\|(?!\|)[^|]*/g, "").split(/\s*(?:==|!=|>=|<=|>|<|&&|\|\|)\s*/).map(s => s.trim()).filter(s => s.length > 0 && !s.startsWith('"') && !s.startsWith("'"));
+      const keyPaths = body.replace(/\|(?!\|)[^|]*/g, "").split(/\s*(?:==|!=|>=|<=|>|<|&&|\|\||[*/+])\s*/).map(s => s.trim()).filter(s => s.length > 0 && !s.startsWith('"') && !s.startsWith("'"));
       for (const keyPath of keyPaths) {
         if (/\s/.test(keyPath)) errors.push({ id: "space_in_key", offset: tag.offset, message: `Key path "${keyPath}" in tag "${tag.raw}" contains a space`, context: tag.raw });
       }
@@ -313,6 +313,32 @@ function findStrayParagraphs(xml) {
   return errors;
 }
 
+function findImageTagsNotInOwnParagraph(xml) {
+  const errors = [];
+  const paraRe = /<w:p[ >][\s\S]*?<\/w:p>/g;
+  const textRe = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+  let pM;
+  while ((pM = paraRe.exec(xml)) !== null) {
+    const pXml = pM[0];
+    let flat = "";
+    textRe.lastIndex = 0;
+    let tm;
+    while ((tm = textRe.exec(pXml)) !== null) flat += tm[1];
+    if (!/\{%[^{}]+\}/.test(flat)) continue;
+    const otherText = flat.replace(/\{[^{}]*\}/g, "").trim();
+    if (otherText.length === 0) continue;
+    const imgTagM = flat.match(/\{%([^{}]+)\}/);
+    errors.push({
+      id: "image_tag_not_in_paragraph",
+      offset: pM.index,
+      message: `Image tag "{%${imgTagM[1]}}" must be the sole content of its paragraph — it currently shares the paragraph with: "${otherText.substring(0, 60)}"`,
+      context: flat.substring(0, 150),
+      fix: "Use Fix & Download to split the image tag into its own paragraph",
+    });
+  }
+  return errors;
+}
+
 function analyzeXmlFile(fileName, xml) {
   const segments = extractTextSegments(xml);
   const { flat, map } = buildFlatText(segments);
@@ -323,6 +349,7 @@ function analyzeXmlFile(fileName, xml) {
   const tags = extractTags(flat);
   for (const err of checkEmvisageTags(tags)) allErrors.push({ ...err, file: fileName, severity: "error" });
   for (const err of findStrayParagraphs(xml)) allErrors.push({ ...err, file: fileName, severity: "warning" });
+  for (const err of findImageTagsNotInOwnParagraph(xml)) allErrors.push({ ...err, file: fileName, severity: "error" });
   const tagCount = tags.length;
   if (tagCount > 0) {
     const wtRe2 = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
@@ -442,6 +469,75 @@ function fixMergedTagRuns(xml) {
   return { xml, fixCount };
 }
 
+function hasTextContent(xml) {
+  const tr = /<w:t(?:\s[^>]*)?>([^<]+)<\/w:t>/g;
+  let m;
+  while ((m = tr.exec(xml)) !== null) { if (m[1].trim().length > 0) return true; }
+  return false;
+}
+
+function fixImageTagParagraphs(xml) {
+  let fixCount = 0;
+  for (let pass = 0; pass < 500; pass++) {
+    const wtRe = /<w:t(?:\s[^>]*)?>(\{%[^{}]+\})<\/w:t>/g;
+    let target = null;
+    let wtM;
+    while ((wtM = wtRe.exec(xml)) !== null) {
+      let pStart = -1, searchPos = wtM.index;
+      while (searchPos >= 0) {
+        searchPos = xml.lastIndexOf("<w:p", searchPos - 1);
+        if (searchPos === -1) break;
+        const ch = xml[searchPos + 4];
+        if (ch === ">" || ch === " ") { pStart = searchPos; break; }
+      }
+      if (pStart === -1) continue;
+      if (/<w:p[ >]/.test(xml.substring(pStart + 4, wtM.index))) continue;
+      const pEndRaw = xml.indexOf("</w:p>", wtM.index);
+      if (pEndRaw === -1) continue;
+      const pEndFull = pEndRaw + 6;
+      const pXml = xml.substring(pStart, pEndFull);
+      let flat = "";
+      const tr = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+      let tm;
+      while ((tm = tr.exec(pXml)) !== null) flat += tm[1];
+      if (flat.replace(/\{[^{}]*\}/g, "").trim().length > 0) { target = { pStart, pEndFull, pXml, wtM: wtM }; break; }
+    }
+    if (!target) break;
+    const { pStart, pEndFull, pXml, wtM: imgWtM } = target;
+    const wtRelPos = imgWtM.index - pStart;
+    const pOpenM = pXml.match(/^<w:p(?:\s[^>]*)?>/);
+    if (!pOpenM) break;
+    const pOpen = pOpenM[0];
+    const pPrM = pXml.match(/<w:pPr>[\s\S]*?<\/w:pPr>/);
+    const pPr = pPrM ? pPrM[0] : "";
+    const pPrRelEnd = pPr ? pXml.indexOf(pPr, pOpen.length) + pPr.length : pOpen.length;
+    const beforeWt = pXml.substring(0, wtRelPos);
+    const rIdx = Math.max(beforeWt.lastIndexOf("<w:r>"), beforeWt.lastIndexOf("<w:r "));
+    if (rIdx === -1 || rIdx < pPrRelEnd) break;
+    let runExtStart = rIdx;
+    const beforeRun = pXml.substring(0, rIdx);
+    const bsM = beforeRun.match(/<w:bookmarkStart\s[^/]*\/>(\s*)$/);
+    if (bsM) runExtStart = bsM.index;
+    const rEndIdx = pXml.indexOf("</w:r>", wtRelPos + imgWtM[0].length);
+    if (rEndIdx === -1) break;
+    let runExtEnd = rEndIdx + 6;
+    const afterRun = pXml.substring(runExtEnd);
+    const beM = afterRun.match(/^(\s*)<w:bookmarkEnd\s[^/]*\/>/);
+    if (beM) runExtEnd += beM[0].length;
+    const before = pXml.substring(pPrRelEnd, runExtStart);
+    const imgRun = pXml.substring(runExtStart, runExtEnd);
+    const after = pXml.substring(runExtEnd, pXml.length - 6);
+    const makeP = (content) => `${pOpen}${pPr}${content}</w:p>`;
+    const newParas = [];
+    if (hasTextContent(before)) newParas.push(makeP(before));
+    newParas.push(makeP(imgRun));
+    if (hasTextContent(after)) newParas.push(makeP(after));
+    xml = xml.substring(0, pStart) + newParas.join("") + xml.substring(pEndFull);
+    fixCount++;
+  }
+  return { xml, fixCount };
+}
+
 function fixDocx(zip) {
   let totalFixes = 0;
   const allXmlFiles = Object.keys(zip.files).filter(f => f.startsWith("word/") && f.endsWith(".xml"));
@@ -452,6 +548,8 @@ function fixDocx(zip) {
     if (splitCount > 0) { xml = splitFixed; totalFixes += splitCount; changed = true; }
     const { xml: tagFixed, fixCount: tagCount } = fixMergedTagRuns(xml);
     if (tagCount > 0) { xml = tagFixed; totalFixes += tagCount; changed = true; }
+    const { xml: imgFixed, fixCount: imgCount } = fixImageTagParagraphs(xml);
+    if (imgCount > 0) { xml = imgFixed; totalFixes += imgCount; changed = true; }
     if (changed) zip.file(name, xml);
   }
   return totalFixes;
